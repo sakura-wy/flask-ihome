@@ -1,0 +1,297 @@
+项目结构目录：
+    1. 对数据库db， redis， session进行配置  创建对象
+
+    2. 拆分目录
+        manage.py 只有跟app运行有关的代码  script manager  migrate
+        ihome/init.py 负责创建各个对象 app session redis db  csrf  配置 注册蓝图 日志
+        config.py 只有跟配置有关的信息
+        api1.0包内存放视图函数 蓝图
+
+数据库表结构设计：
+    多对多字段：
+        house_facility = db.Table(
+            "ih_house_facility",
+            db.Column("house_id", db.Integer, db.ForeignKey("ih_house_info.id"), primary_key=True),  # 房屋编号
+            db.Column("facility_id", db.Integer, db.ForeignKey("ih_facility_info.id"), primary_key=True)  # 设施编号
+        )
+    
+    跨表查询字段：
+        House模型下：
+            facilities = db.relationship("Facility", secondary=house_facility)  # 房屋的设施
+
+
+静态文件接口：
+    定义一个commons.py文件 正则转换器
+    web_html文件 负责编写提供静态文件url的蓝图 
+        # flask提供的返回静态文件的方法
+        return current_app.send_static_file(file_name)
+
+    csrf防护机制：（post, put, delete）
+        从cookie中获取一个csrf_token值
+        从请求体中获取一个csrf_token值
+            如果请求体的数据不是表单格式
+            将csrf_token的值可以放到请求头中，X-CSRFToken
+        如果两个值相同，检验通过，可以进入到视图函数中执行，如果两个值不同，则检验失败，向前端返回状态码400
+        
+        在__init__.py中添加csrf
+            from flask_wtf import CSRFProtect
+            CSRFProtect（app）
+
+        在web_html视图中实现设置cookie csrf_token
+            # 创建一个csrf_token的值
+            from flask_wtf import csrf
+            csrf_token = csrf.generate_csrf()
+            resp.set_cookie("csrf_token", csrf_token)
+        
+        # 在wtf中session也会保存csrf_token
+        当退出登录时删除session会导致csrf_token缺失  需要保留
+
+
+图片验证码:
+    流程：
+        1. 浏览器发起获取图片验证码的请求，并生成一个编号发送到服务器，
+           服务器生成验证码图片返回，并将验证码的真实值和编号存到redis中
+        
+        2. 浏览器发起获取短信验证码的请求到服务器，携带参数：填写的数据，图片验证码的编号
+           服务器验证图片验证码的正确性，如果正确，发送短信验证码
+
+    获取图片验证码视图：
+        采用redis  str 存储验证码真实值和编号  hash只能整体设置过期时间
+        保存失败则将错误信息写入日志， 返回json异常信息
+        保存成功则发送图片验证码
+        resp = send_file(image_data,
+                     attachment_filename='image_code.jpg',
+                     mimetype='image/jpg')
+        return resp
+    前端：
+        生成编号uuid 拼接好url  设置点击图片的img标签src属性设置为url
+
+
+短信验证码：
+    使用云通讯接口  初始化REST类进行短信发送  
+    避免发生每次创建类而产生延迟  自己封装CCP类进行封装  采用单例模式
+
+    流程：
+        1. 校验image_code image_code_id, 删除redis中的image_code，防止对同一图片验证多次
+        2. 判断手机号是否存在
+        3. 将验证码存入redis中，并发送
+        ccp = CCP()
+        result = ccp.send_template_sms(mobile, [sms_code, int(constants.SMS_CODE_REDIS_EXPIRES/6)], 1)
+        
+        4. 60s内不准重复发送, 将手机号对应的时间也存入redis
+        redis_store.setex("send_sms_code_%s" % mobile, constants.SEND_SMS_CODE_INTERVAL, 1)
+
+    前端： 
+        拼接前端url: mobile?image_code=xx&image_code_id=xxx
+        ajax发送请求， 成功则返回计时器60s
+
+注册：
+    流程：
+        1. 获取返回的json数据
+        req_dict = request.get_json()
+        2. 校验数据完整性，手机号格式和两次密码是否一致
+        3. 从redis中取出短信验证码进行校验
+        4. 取出后删除redis数据，防止验证多次手机验证码
+        5. 判断手机号是否重复+用户信息注册数据库 (合并) IntegrityError
+            成功 db.session.add(user)  db.session.commit()
+            失败  db.session.rollback()
+            保存用户信息时 密码加密加校验时：
+            user表中设置:
+            from werkzeug.security import generate_password_hash, check_password_hash
+                @property
+                def password(self):
+                    raise AttributeError("只能设置不能取")
+                
+                @password.setter
+                def password(self, val):
+                    self.password_hash = generate_password_hash(value)
+                
+                def check_password(self, passwd):
+                    return check_password_hash(self.password_hash, passwd)
+
+        6. 保存登录状态到session信息
+        7. 返回响应信息
+    
+    前端：  
+        为表单的提交功能补充自定义的函数行为，拦截默认的form形式提交
+        ajax请求返回json数据
+        var req_json = JSON.stringify(req_data);
+        ajax发送请求中携带csrftoken请求头:
+            headers:{
+                'X-CSRFToken': getCookie('csrf_token')
+            },
+
+登录：
+    流程： 
+        1. 获取参数  手机号和密码
+        2. 校验参数完整，手机号格式 获取用户ip地址
+            user_ip = request.remote_attr  # 用户的ip地址
+        3. 从redis中取出access_num值，判断是否超出登录次数
+        4. 从数据库中查询数据对象
+        5. 验证user对象或密码是否正确,
+         if user is None or not user.check_password(password)
+        6. 验证失败 返回错误信息  增加超时次数 最后一次设置超时时间
+        7. 验证成功  将对象数据保存session
+        8. 返回响应
+
+
+登录校验器：
+    装饰器来写  @wraps(view_func)来防止被装饰函数的name属性修改
+    用g对象来保存一次视图函数所用到的信息，可直接调用
+
+退出：
+    清除session数据
+
+
+个人信息图片存储；
+    七牛云存储
+        image_storage.py文件
+    流程： 
+        1. 获取图片和用户id(g对象中)
+        2. 校验
+        3. 使用七牛的storage视图上传图片
+        4. 将图片名称更新到数据库avatar_url字段
+        5. 将图片的整个链接拼接返回到前端
+    
+    前端：
+        阻止表单默认行为
+        ajax发送请求获取图片
+        form异步提交  插件  jquery.form.min.js
+
+
+城区信息：
+    添加redis缓存
+    流程：  
+        1. 从redis中获取缓存，如果拿到则直接返回
+        2. 未拿到，尝试从数据库中获取信息，转换为json格式数据，并将
+            数据设置到redis中，直接返回获取的信息
+            return resp_json, 200, {"Content-Type": "application/json"}
+    
+    前端：
+        atr-template 前端js模板
+        ajax请求城区信息，areas传递到前端模板实现动态实时更新城区信息
+
+    缓存数据的同步问题：
+        保证mysql和redis数据的一直相同问题
+        1. 在操作mysql的时候，删除缓存数据
+        2. 给redis缓存数据设置有效期，保证过了有效期，缓存数据会被删除
+
+发布房源：
+    保存房屋和图片信息
+
+
+celery:
+    一个celery系统可以把汗很多的worker和broker，可增强横向扩展性和高可用
+    客户端--> 任务发送到任务队列(broker) rabbitMQ redis  <--  任务处理者(worker) 多进程(默认)
+
+    开启celery worker
+    celery -A 定义任务的python模块 worker -l info
+
+    from celery import Celery
+    app = Celery("ihome")
+    app.autodiscover_tasks(["ihome.tasks.sms"]) 自动搜寻task任务
+
+    tasks文件:
+
+    @app.tasks
+    def send_sms(to, datas, temp_id):
+        '''发送短信的异步任务'''
+        ccp = CCP()
+        ccp.send_template_sms(to, datas, temp_id)
+
+    使用celery异步发送短信，delay函数调用后会立即返回
+    result = send_sms.delay(mobile, [sms_code, int(constants.SMS_CODE_REDIS_EXPIRES/60)], 1) 
+
+    通过get方法能获取celery执行结果，默认阻塞，等到结果才返回
+    也可以接收参数timeout 超过时间没有结果会返回
+    ret = result.get()
+
+
+房屋管理：
+    获取房东发布的房源信息  实名认证才能访问 前端实现
+    获取主页房源信息  redis缓存 无缓存根据热度排序显示房源  如果没有图片跳过该房源
+    获取房屋详细信息  redis缓存  浏览用户不是房东，显示预定按钮
+
+    搜索  房屋列表
+    1. 校验处理时间和区域id  处理页数  默认为1 
+    2. 查询缓存  hash
+    3. 查询数据库 设置冲突时间的列表 反向过滤
+        conflict_orders = Order.query.filter(Order.begin_date <= end_data, Order.end_date >= start_data).all()
+        if conflict_orders:
+            conflict_house_ids = [order.house_id for order in conflict_orders]
+            if conflict_house_ids:
+                filter_params.append(House.id.notin_(conflict_house_ids))
+    4. 区域条件过滤，返回条件，查询
+         house_query = House.query.filter(*filter_params).order_by(order_by_param)
+    5. 分页
+        page_obj = house_query.paginate(page=page, per_page=constants.HOUSE_LIST_PER_PAGE_CAPACITY, error_out=False )
+    6. 组织页面数据
+    7. 设置缓存
+        hash数据  采用pipeline管道对象一次执行多个语句
+        # 创建redis管道对象， 可以一次执行多个语句
+        pipeline = redis_store.pipline()
+        # 开启多个语句的记录
+        pipeline.multi()
+        pipeline.hset(redis_key, page, resp_json)
+        pipeline.expire(redis_key, constants.HOUSE_LIST_PAGE_REDIS_EXPIRE)
+
+        # 执行语句
+        pipeline.execute()
+    
+
+订单模块:
+    保存订单；
+    1. 校验订单 日期  房屋信息
+    2. 判断是否为房东 房东不可以预定自己的房间
+    3. 判断订单冲突情况  被预定返回冲突
+    4. 生成订单，返回数据
+
+    查询用户的订单数据：
+    1. 查询数据库  用户和用户名下的订单接口放在一起 role区分
+    2. 返回orders数据
+
+    接单，拒单：
+    1. 获取参数  action ： accept  reject
+    2. 查询订单 订单必须在等待接单状态
+    3. 只有房东能接单拒单
+    4. 根据action 修改order.status
+    5. 拒单需要返回原因  order.comment = reason
+
+    保存订单评论信息：
+    1. 检查参数  comment
+    2. 评论必须是自己下的才能保存，而且订单状态为待评价
+    3. 修改订单状态  房屋完成订单数+1  house.order_count += 1
+    4. 删除redis缓存 呈现新的评价信息
+
+支付：
+    支付宝支付：
+        alipay = AliPay(
+        appid='2016092900620771',  # 应用ID
+        # app_notify_url=None,  # 默认回调url
+        app_private_key_path=os.path.join(os.path.dirname(__file__), 'keys/app_private_key.pem'),  # 应用私钥
+        alipay_public_key_path=os.path.join(os.path.dirname(__file__), 'keys/alipay_public_key.pem'),
+        # 支付宝公钥
+        sign_type="RSA2",  # RSA 或者 RSA2 -- 这里注意一点：2018年1月5日后创建的应用只支持RSA2的格式；
+        debug=True  # 默认False -- 设置为True则是测试模式
+        )
+
+        # 手机网站支付
+        total_amount = str(order.amount / 100.0)
+        order_string = alipay.api_alipay_trade_wap_pay(
+            out_trade_no=order_id,  # 订单编号
+            total_amount=total_amount,  # 总金额，以元为单位的字符串
+            subject='爱家租房_{}'.format(order_id),  # 订单标题
+            return_url="http://127.0.0.1:5000/orders.html",  # 返回的链接地址
+            notify_url=None  # 可选, 不填则使用默认notify url
+        )
+        # 合成跳转地址
+        pay_url = constants.API_PAY_ADDRESS + order_string
+    
+    手机网站支付流程：
+        1.1 用户下单， 商户系统生成订单，构造支付请求
+        1.2 商户系统向支付宝发送支付请求，支付宝向用户展示支付信息
+        1.3 用户输入支付密码确认支付到支付宝
+        1.4 完成支付，支付宝页面返回支付结果return_url(返回网站url)  后台通知支付结果notify_url(通知url接收支付宝的通知消息)到商户系统
+        1.5 商户系统对返回数据进行处理，向用户展示订单信息
+        2.1 商户系统请求关闭订单到支付宝，支付宝返回处理结果
+        3.1 用户发起查询，商户系统向支付宝发起查询请求，支付宝返回支付状态
